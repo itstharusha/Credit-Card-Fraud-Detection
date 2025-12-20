@@ -1,191 +1,57 @@
+# app.py
 import streamlit as st
-import numpy as np
 import pandas as pd
+import numpy as np
 import joblib
-import matplotlib.pyplot as plt
-
 from lime.lime_tabular import LimeTabularExplainer
-from sklearn.inspection import permutation_importance
 
-# =====================================================
-# App Config
-# =====================================================
-st.set_page_config(
-    page_title="Fraud Detection Platform",
-    page_icon="💳",
-    layout="wide"
-)
+# Load models
+lr_pipeline = joblib.load("lr_pipeline.joblib")
+rf_pipeline = joblib.load("rf_pipeline.joblib")
+xgb_pipeline = joblib.load("xgb_tuned_pipeline.joblib")
+threshold = joblib.load("best_threshold.joblib")
 
-st.title("💳 Credit Card Fraud Detection Platform")
-st.caption("Ensemble ML • Explainable AI • Production-Ready")
+st.set_page_config(page_title="Credit Card Fraud Detection", layout="wide")
+st.title("Credit Card Fraud Detection Dashboard")
+st.sidebar.header("Enter Transaction Features")
 
-# =====================================================
-# Load Models
-# =====================================================
-@st.cache_resource
-def load_assets():
-    lr = joblib.load("model/lr_pipeline.joblib")
-    rf = joblib.load("model/rf_pipeline.joblib")
-    xgb = joblib.load("model/xgb_tuned_pipeline.joblib")
-
-    with open("model/ensemble_threshold.txt") as f:
-        threshold = float(f.read())
-
-    return lr, rf, xgb, threshold
-
-
-lr_model, rf_model, xgb_model, THRESHOLD = load_assets()
-
-# =====================================================
-# Sidebar Inputs
-# =====================================================
-st.sidebar.header("🧾 Transaction Details")
-
-def get_user_input():
+# User input function
+def user_input_features():
     data = {}
-    for i in range(1, 29):
-        data[f"V{i}"] = st.sidebar.number_input(f"V{i}", value=0.0)
+    for col in lr_pipeline.named_steps['preprocess'].transformers_[0][2]:
+        data[col] = [st.sidebar.number_input(f"{col}", value=0.0)]
+    return pd.DataFrame(data)
 
-    data["Amount"] = st.sidebar.number_input("Transaction Amount", value=120.0)
-    data["Time"] = st.sidebar.number_input("Time (seconds)", value=100000.0)
+input_df = user_input_features()
 
-    return pd.DataFrame([data])
+if st.button("Predict Fraud"):
+    lr_prob = lr_pipeline.predict_proba(input_df)[:, 1]
+    rf_prob = rf_pipeline.predict_proba(input_df)[:, 1]
+    xgb_prob = xgb_pipeline.predict_proba(input_df)[:, 1]
 
+    ensemble_prob = 0.2 * lr_prob + 0.3 * rf_prob + 0.5 * xgb_prob
+    pred = (ensemble_prob >= threshold).astype(int)[0]
 
-X_input = get_user_input()
+    st.subheader("Prediction Result")
+    st.write("Fraud" if pred == 1 else "Legitimate")
+    st.write(f"Fraud Probability: {ensemble_prob[0]:.2%}")
 
-# =====================================================
-# Prediction Logic
-# =====================================================
-lr_prob = lr_model.predict_proba(X_input)[:, 1][0]
-rf_prob = rf_model.predict_proba(X_input)[:, 1][0]
-xgb_prob = xgb_model.predict_proba(X_input)[:, 1][0]
-
-ensemble_prob = (
-    0.2 * lr_prob +
-    0.3 * rf_prob +
-    0.5 * xgb_prob
-)
-
-prediction = int(ensemble_prob >= THRESHOLD)
-
-# Risk Banding
-if ensemble_prob < 0.3:
-    risk = "LOW"
-elif ensemble_prob < 0.7:
-    risk = "MEDIUM"
-else:
-    risk = "HIGH"
-
-# =====================================================
-# Tabs Layout
-# =====================================================
-tab1, tab2, tab3 = st.tabs([
-    "📊 Prediction Summary",
-    "🧠 Local Explanation (LIME)",
-    "🌍 Global Feature Importance"
-])
-
-# =====================================================
-# TAB 1 — Summary
-# =====================================================
-with tab1:
-    st.subheader("Model Decision Summary")
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Fraud Probability", f"{ensemble_prob:.4f}")
-    col2.metric("Risk Level", risk)
-    col3.metric("Decision Threshold", f"{THRESHOLD:.2f}")
-
-    st.divider()
-
-    if prediction == 1:
-        st.error("🚨 High-risk transaction flagged as FRAUD")
-    else:
-        st.success("✅ Transaction classified as LEGITIMATE")
-
-    st.subheader("Ensemble Breakdown")
-    breakdown = pd.DataFrame({
-        "Model": ["Logistic Regression", "Random Forest", "XGBoost"],
-        "Fraud Probability": [lr_prob, rf_prob, xgb_prob],
-        "Weight": [0.2, 0.3, 0.5]
-    })
-
-    st.dataframe(breakdown, use_container_width=True)
-
-# =====================================================
-# TAB 2 — LIME
-# =====================================================
-with tab2:
-    st.subheader("Local Explanation (Why this prediction?)")
-
-    explainer = LimeTabularExplainer(
-        training_data=np.array(X_input),
-        feature_names=X_input.columns,
+    # Feature Contribution (Top 5)
+    X_train_scaled = lr_pipeline.named_steps['preprocess'].transform(pd.read_csv("X_train.csv"))
+    lime_explainer = LimeTabularExplainer(
+        training_data=X_train_scaled,
+        feature_names=input_df.columns,
         class_names=["Legit", "Fraud"],
         mode="classification"
     )
 
-    explanation = explainer.explain_instance(
-        X_input.iloc[0].values,
-        xgb_model.predict_proba,
-        num_features=10
-    )
+    def predict_fn_wrapper(X_array):
+        X_df = pd.DataFrame(X_array, columns=input_df.columns)
+        lr_p = lr_pipeline.predict_proba(X_df)[:, 1]
+        rf_p = rf_pipeline.predict_proba(X_df)[:, 1]
+        xgb_p = xgb_pipeline.predict_proba(X_df)[:, 1]
+        return (0.2 * lr_p + 0.3 * rf_p + 0.5 * xgb_p).reshape(-1, 1)
 
-    fig = explanation.as_pyplot_figure()
-    st.pyplot(fig)
-
-    st.subheader("Top Feature Contributions")
-    lime_df = pd.DataFrame(
-        explanation.as_list(),
-        columns=["Feature", "Impact"]
-    )
-
-    st.dataframe(lime_df, use_container_width=True)
-
-# =====================================================
-# TAB 3 — Global Importance
-# =====================================================
-with tab3:
-    st.subheader("Global Feature Importance (Permutation)")
-
-    st.info("Computed on synthetic batch for demonstration purposes")
-
-    if st.button("Run Permutation Importance"):
-        with st.spinner("Computing..."):
-            sample = pd.concat([X_input] * 100, ignore_index=True)
-
-            r = permutation_importance(
-                xgb_model,
-                sample,
-                np.zeros(len(sample)),
-                n_repeats=5,
-                random_state=42,
-                n_jobs=-1
-            )
-
-            importance_df = pd.DataFrame({
-                "Feature": X_input.columns,
-                "Importance": r.importances_mean
-            }).sort_values("Importance", ascending=False)
-
-            fig, ax = plt.subplots(figsize=(8, 5))
-            ax.barh(
-                importance_df.head(10)["Feature"],
-                importance_df.head(10)["Importance"]
-            )
-            ax.invert_yaxis()
-            ax.set_title("Top Global Features")
-
-            st.pyplot(fig)
-            st.dataframe(importance_df.head(15), use_container_width=True)
-
-# =====================================================
-# Footer
-# =====================================================
-st.divider()
-st.caption(
-    "Built with scikit-learn, XGBoost & Streamlit • Designed for real-world deployment"
-)
-
+    exp = lime_explainer.explain_instance(input_df.iloc[0].values, predict_fn_wrapper, num_features=5)
+    st.subheader("Top 5 Feature Contributions")
+    st.write(exp.as_list())
